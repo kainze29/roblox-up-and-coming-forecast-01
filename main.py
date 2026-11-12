@@ -5,17 +5,45 @@ Reads /input/history.ndjson (snapshots of the chart) and /input/task.json,
 writes /output/forecast.json: for each of the top 10 places, a probability for
 each game named being at that place, plus a top-10 guess.
 
-Method: empirical rank-transition kernel, averaged over the scored window.
-The chart's own history says how ranks move: for every pair of reads, each
-game's rank change is recorded by its starting rank band (1-10, 11-30, 31-60,
-61+) and the time between the reads. That gives, per band and per horizon,
-the distribution of a game's rank change and its chance of still being on the
-chart. A game is forecast by shifting its band's distribution by its own
-recent rank velocity (shrunk, because velocity only weakly persists:
-autocorrelation ~0.22 in the archive) and averaging over the window's hours.
-The top band is far stickier than the rest (median |change| 2 ranks in 24h
-vs 7-12 lower down), which a single Gaussian misses, so the kernel is used
-directly instead of a fitted curve.
+Method: empirical rank-transition kernel, averaged over the scored window,
+ensembled 85/15 with the persistence baseline, with two playing-count
+signals. The chart's own history says how ranks move: for every pair of
+reads, each game's rank change is recorded by its starting rank band (1-10,
+11-30, 31-60, 61+) and the time between the reads. That gives, per band and
+per horizon, the distribution of a game's rank change and its chance of
+still being on the chart. A game is forecast by shifting its band's
+distribution by its own recent rank velocity (shrunk, because velocity only
+weakly persists: autocorrelation ~0.22 in the archive) and averaging over
+the window's hours. The top band is far stickier than the rest (median
+|change| 2 ranks in 24h vs 7-12 lower down), which a single Gaussian misses,
+so the kernel is used directly instead of a fitted curve.
+
+Two signals beyond rank velocity, both validated walk-forward on the public
+archive (8 cut points, 86 scored reads) against the kernel alone:
+- Playing-implied rank velocity: the chart is sorted by user growth, and
+  the playing order moves before the (computed, lagging) rank does, so the
+  slope of a game's playing-implied rank is added to its rank velocity
+  (shrink 0.15). A snapshot's playing gap (actual rank minus implied rank)
+  is also closed at 0.3 per 48h, as before.
+- Persistence ensemble: 15% of the house persistence baseline is mixed in.
+  The kernel spreads mass thin over 72h of churn; the baseline re-concentrates
+  some of it on the chart as it stands, which the early, most predictable
+  window hours reward. Walk-forward mean -37.23 vs -38.10 for the kernel
+  alone (original 4 cuts -37.14 vs -37.50; 4 fresh holdout cuts -37.31 vs
+  -38.70).
+
+Tried and rejected on the same walk-forward (all worse or noise): recency
+weighting of kernel pairs, decaying drift persistence, per-place named
+mass from measured entrant rates, a newcomer-climb (tenure) bonus (the
+diagnostic gap is real but rank velocity already captures it), velocity
+windows 24/72/96h, shrink 0/0.15/0.5/0.7, gap-close 0/0.15/0.5/0.7, kernel
+bandwidth 6/24/48, smoothing 1/3/4, named mass 0.70/0.90/0.95, and a
+Gaussian-only model.
+
+Mass deliberately left unnamed at each place covers games the kernel cannot
+name: brand-new entrants and fast climbers from deep in the chart (in the
+archive, 12-42% of top-10 slots 48-96h out are games that were not on the
+chart at the earlier read).
 
 Mass deliberately left unnamed at each place covers games the kernel cannot
 name: brand-new entrants and fast climbers from deep in the chart.
@@ -43,11 +71,18 @@ NAMED_SHRINK = float(os.environ.get("MF_NAMED_SHRINK", "1.0"))  # scale named ma
 P_FLOOR = float(os.environ.get("MF_P_FLOOR", "0.002"))    # smallest row written
 P_CAP = float(os.environ.get("MF_P_CAP", "0.60"))         # largest row written
 NAMED_TARGET = float(os.environ.get("MF_NAMED", "0.80"))  # named mass per place
+NAMED_BY_PLACE = os.environ.get("MF_NAMED_BY_PLACE", "")  # e.g. "0.9,0.88,..." overrides MF_NAMED per place
+BASE_MIX = float(os.environ.get("MF_BASE_MIX", "0.15"))  # mix with persistence baseline
+REC_TAU_H = float(os.environ.get("MF_REC_TAU_H", "0"))    # recency half-life-ish tau for kernel pairs (0=off)
+DRIFT_TAU_H = float(os.environ.get("MF_DRIFT_TAU_H", "0"))  # drift persistence tau, hours (0=linear)
+PLAY_SHRINK = float(os.environ.get("MF_PLAY_SHRINK", "0.15"))  # shrink for implied-rank (playing) velocity
+TENURE_A = float(os.environ.get("MF_TENURE_A", "0"))      # new-entrant climb bonus, ranks/hour (0=off)
+TENURE_TAU_H = float(os.environ.get("MF_TENURE_TAU_H", "48"))  # tenure decay tau, hours
 MIN_OBS_VELOCITY = 3
 # kernel parameters
 BW_H = float(os.environ.get("MF_BW", "12"))              # horizon smoothing, hours
 SMOOTH_SD = float(os.environ.get("MF_SMOOTH", "2.0"))     # rank smoothing of the kernel
-FLOOR_MIX = float(os.environ.get("MF_FLOOR_MIX", "0.02")) # uniform floor mixed in
+FLOOR_MIX = float(os.environ.get("MF_FLOOR_MIX", "0.0")) # uniform floor mixed in
 DELTA_MAX = 120                                           # |rank change| clipped here
 H_GROUPS = [(1, 6), (7, 12), (13, 24), (25, 36), (37, 48), (49, 60), (61, 72)]
 # gaussian fallback parameters
@@ -131,6 +166,11 @@ def build_kernel(reads):
             dt = tj - ti
             if dt <= 0 or dt > 200:
                 continue
+            # Recency weight: pairs ending long ago count less (chart regime
+            # drifts as games age out of the 28-day window).
+            w_rec = 1.0
+            if REC_TAU_H > 0:
+                w_rec = math.exp(tj / REC_TAU_H)  # tj <= 0, hours before end
             dt_bin = int(round(dt))
             for uid, r0 in ri.items():
                 b = band_of(r0)
@@ -140,14 +180,14 @@ def build_kernel(reads):
                     cell = ([0.0] * n_grid, 0.0, 0.0)
                     cells[key] = cell
                 hist, absent, total = cell
-                cell = (hist, absent, total + 1.0)
+                cell = (hist, absent, total + w_rec)
                 cells[key] = cell
                 if uid in rj:
                     d = int(round(rj[uid] - r0))
                     d = max(-DELTA_MAX, min(DELTA_MAX, d))
-                    hist[d + DELTA_MAX] += 1.0
+                    hist[d + DELTA_MAX] += w_rec
                 else:
-                    cells[key] = (hist, absent + 1.0, total + 1.0)
+                    cells[key] = (hist, absent + w_rec, total + w_rec)
     # Smooth the Delta histogram once per cell is too costly; smooth per
     # (band, group) after weighting instead.
     xs, ws = gauss_kernel(SMOOTH_SD, 6)
@@ -231,6 +271,8 @@ def main():
     t_end = parse_time(snaps[-1]["at"])
 
     obs = {}
+    obs_imp = {}
+    first_seen = {}
     reads = []
     for s in snaps:
         t = (parse_time(s["at"]) - t_end).total_seconds() / 3600.0
@@ -239,7 +281,18 @@ def main():
             uid = row["universe_id"]
             ranks[uid] = float(row["rank"])
             obs.setdefault(uid, []).append((t, float(row["rank"])))
+            if uid not in first_seen:
+                first_seen[uid] = t
         reads.append((t, ranks))
+    # Implied rank per read, from the playing order (for the playing-velocity
+    # signal below).
+    obs_imp = {}
+    for s in snaps:
+        t = (parse_time(s["at"]) - t_end).total_seconds() / 3600.0
+        rows = s.get("up_and_coming") or []
+        by_play = sorted(rows, key=lambda r: -(r.get("playing") or 0))
+        for i, r in enumerate(by_play):
+            obs_imp.setdefault(r["universe_id"], []).append((t, float(i + 1)))
     last_chart = reads[-1][1]
     n_chart = max(len(last_chart), 1)
 
@@ -256,8 +309,36 @@ def main():
 
     prob = {uid: [0.0] * (places + 1) for uid in last_chart}
     exp_rank = {}
+    # Persistence-baseline distribution, for the optional ensemble mix.
+    last_order = sorted(last_chart, key=lambda u: last_chart[u])
+    base_p = {}
+    for idx, uid in enumerate(last_order):
+        rk = idx + 1
+        for k in range(1, places + 1):
+            if k == 1:
+                p = 0.5 if rk == 1 else (0.3 if rk == 2 else 0.0)
+            else:
+                p = 0.5 if rk == k else (0.15 if abs(rk - k) == 1 else 0.0)
+            if p:
+                base_p[(uid, k)] = p
     for uid, r0 in last_chart.items():
         drift = estimate_drift(obs.get(uid, []), DRIFT_WINDOW_H)
+        if TENURE_A:
+            # Newcomer climb: games first seen on the chart recently keep
+            # climbing (mean -3.2 ranks over 24-96h) while veterans fall
+            # (mean +7.7); the band kernel averages both, so give fresh
+            # games a drift bonus decaying with their time on the chart.
+            tenure_h = -first_seen.get(uid, 0.0)
+            drift = max(-DRIFT_CAP, min(DRIFT_CAP,
+                                        drift - TENURE_A * math.exp(-tenure_h / TENURE_TAU_H)))
+        if PLAY_SHRINK:
+            # Playing-implied rank velocity: a game whose player count is
+            # climbing the playing order tends to climb the chart too, and
+            # playing moves before the (computed, lagging) rank does.
+            play_drift = estimate_drift(obs_imp.get(uid, []), DRIFT_WINDOW_H)
+            # estimate_drift already applies DRIFT_SHRINK; rescale to PLAY_SHRINK.
+            play_drift = play_drift / DRIFT_SHRINK * PLAY_SHRINK if DRIFT_SHRINK else 0.0
+            drift = max(-DRIFT_CAP, min(DRIFT_CAP, drift + play_drift))
         if GAP_CLOSE:
             gap = r0 - implied.get(uid, r0)
             drift = max(-DRIFT_CAP, min(DRIFT_CAP, drift - GAP_CLOSE * gap / 48.0))
@@ -269,9 +350,15 @@ def main():
             w_hours = min(hi, n_hours) - lo + 1
             if w_hours <= 0:
                 continue
+            # Velocity does not persist linearly for 72h: with DRIFT_TAU_H,
+            # the effective horizon saturates (drift decays exponentially).
+            if DRIFT_TAU_H > 0:
+                h_eff = DRIFT_TAU_H * (1.0 - math.exp(-h_mid / DRIFT_TAU_H))
+            else:
+                h_eff = h_mid
             if use_kernel and (b, gi) in kernel:
                 cdf, surv = kernel[(b, gi)]
-                shift = drift * h_mid
+                shift = drift * h_eff
                 for k in range(1, places + 1):
                     p = cdf_at(cdf, k + 0.5 - r0 - shift)
                     if k > 1:
@@ -280,7 +367,7 @@ def main():
             else:
                 # Gaussian fallback for this band/horizon.
                 surv = (1.0 - band_hazard(r0)) ** h_mid
-                mean = r0 + drift * h_mid
+                mean = r0 + drift * h_eff
                 sd = min(SD_MAX, SIGMA1 * math.sqrt(h_mid))
                 below = norm_cdf((0.5 - mean) / sd)
                 for k in range(1, places + 1):
@@ -288,15 +375,29 @@ def main():
                     if k == 1:
                         p += below
                     acc[k] += surv * p * w_hours
-            er += min(max(r0 + drift * h_mid, 1.0), float(n_chart)) * w_hours
+            er += min(max(r0 + drift * h_eff, 1.0), float(n_chart)) * w_hours
         for k in range(1, places + 1):
             prob[uid][k] = acc[k] / n_hours
         exp_rank[uid] = er / n_hours
 
+    if BASE_MIX:
+        for uid in last_chart:
+            for k in range(1, places + 1):
+                prob[uid][k] = ((1.0 - BASE_MIX) * prob[uid][k]
+                                + BASE_MIX * base_p.get((uid, k), 0.0))
+
+    named_targets = None
+    if NAMED_BY_PLACE:
+        try:
+            named_targets = [float(x) for x in NAMED_BY_PLACE.split(",")]
+        except ValueError:
+            named_targets = None
     rows = []
     for k in range(1, places + 1):
         tot = sum(prob[uid][k] for uid in last_chart)
-        scale = (NAMED_TARGET / tot) if tot > NAMED_TARGET else 1.0
+        target = (named_targets[k - 1] if named_targets and k - 1 < len(named_targets)
+                  else NAMED_TARGET)
+        scale = (target / tot) if tot > target else 1.0
         for uid in last_chart:
             p = prob[uid][k] * scale * NAMED_SHRINK
             if p >= P_FLOOR:
